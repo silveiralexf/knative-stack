@@ -1,0 +1,23 @@
+#!/bin/bash
+
+set -eu
+
+# Sets terminal color support
+export TERM=screen-256color
+
+NC='\033[0m' # No Color
+RED='\033[0;31m'
+ERROR="${RED}[ERROR]${NC}"
+
+# list of exceptions
+SKIPPERS="tmp/|dist/|config/*|zz_generated|\/README.md$"
+
+# Run Pre-Commit checks only for updated files
+if command -v pre-commit >/dev/null; then
+	exec git status --porcelain --short | awk -F " " '{ print $2}' | grep -vE "${SKIPPERS}" | xargs pre-commit run --files
+	exit 0
+else
+	echo -e "${ERROR} pre-commit not found.  brew install pre-commit to have it installed" 1>&2
+	git add -u
+fi
+

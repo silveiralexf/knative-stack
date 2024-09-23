@@ -1,0 +1,352 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: '3'
+silent: true
+
+vars:
+  CLUSTER: knative-stack
+  K8S: k3d
+  CLUSTER_NAME: "{{.K8S}}-{{.CLUSTER}}"
+  CLUSTER_REGISTRY_NAME: "{{.CLUSTER_NAME}}-registry"
+  CLUSTER_REGISTRY_PORT: 5000
+  FUNC_REGISTRY: "{{.CLUSTER_REGISTRY_NAME}}:{{.CLUSTER_REGISTRY_PORT}}"
+  CLUSTER_AGENTS: 3
+  CLUSTER_SERVERS: 1
+  KUBECONFIG: "{{.USER_WORKING_DIR}}/.kubeconfig"
+  KUBE_API_SERVER_PORT: 6443
+  KUBECTL: kubectl apply -f
+  DEMO_NAMESPACE: bookstore
+  KNATIVE_OPERATOR_VERSION: v1.15.4
+  KNATIVE_CORE_VERSION: v1.15.2
+  KNATIVE_SERVING_VERSION: v1.15.2
+  KNATIVE_EVENTING_VERSION: v1.15.1
+  KNATIVE_EVENTING_KAFKA_CONTROLLER_VERSION: v1.15.3
+  KNATIVE_ISTIO_VERSION: v1.15.1
+  CERTMANAGER_VERSION: v1.15.3
+  LOCALBIN: "{{.USER_WORKING_DIR}}/bin"
+
+env:
+  PATH: ${PATH}:{{.USER_WORKING_DIR}}/bin
+  GOBIN: "{{.LOCALBIN}}"
+  REGISTRY_HOST: "{{.CLUSTER_REGISTRY_NAME}}:{{.CLUSTER_REGISTRY_PORT}}"
+  KO_DOCKER_REPO: "{{.CLUSTER_REGISTRY_NAME}}:{{.CLUSTER_REGISTRY_PORT}}"
+
+tasks:
+  default:
+    silent: true
+    desc: List all of the available commands
+    cmds:
+      - task -l --sort none
+
+  hooks:
+    desc: Setup pre-commit hooks
+    status:
+      - test -f {{.USER_WORKING_DIR}}/hooks/precommit
+      - test -f {{.USER_WORKING_DIR}}/hooks/commit-msg
+    cmds:
+      - cp {{.USER_WORKING_DIR}}/scripts/hooks/* {{.USER_WORKING_DIR}}/.git/hooks/
+      - echo "✅ Precommit hooks successfully updated"
+    silent: true
+
+  precommit:
+    deps:
+      - hooks
+    desc: Setup pre-commit hooks
+    cmds:
+      - echo "Configuring pre-commit"
+      - "{{.USER_WORKING_DIR}}/scripts/hooks/pre-commit"
+
+  up:
+    desc: Bootstraps Knative Serving+Eventing on K3D cluster with Istio and Certmanager
+    cmds:
+      - task: k3d:install
+      - task: certmanager:install
+      - task: camel-k:install
+      - task: istio:install
+      - task: knative:serving:install
+      - task: knative:eventing:install
+      - task: istio:setup:injection
+      - task: knative:serving:setup:peerauth
+      - task: istio:install:verify
+
+  down:
+    desc: Delete k3d cluster resources.
+    requires:
+      vars:
+        - CLUSTER
+        - KUBECONFIG
+    cmds:
+      - echo "Deleting cluster {{.CLUSTER}}"
+      - k3d cluster delete "{{.CLUSTER}}"
+      - rm -rf "{{.KUBECONFIG}}"
+
+  k3d:getconfig:
+    desc: Get kubeconfig from local cluster
+    internal: true
+    cmds:
+      - cmd: k3d kubeconfig get "{{.CLUSTER}}" > "{{.KUBECONFIG}}"
+
+  k3d:install:
+    desc: Install k3d cluster
+    cmds:
+      - cmd: |
+          k3d cluster create {{.CLUSTER}} \
+           --registry-create "{{.CLUSTER_REGISTRY_NAME}}:{{.CLUSTER_REGISTRY_PORT}}" \
+           --api-port localhost:{{.KUBE_API_SERVER_PORT}} \
+           -p '3000:3000@loadbalancer' \
+           -p '8000:8000@loadbalancer' \
+           -p '8080:80@loadbalancer' \
+           -p '9443:443@loadbalancer' \
+           --k3s-arg '--disable=traefik@server:*' \
+           --servers="{{.CLUSTER_SERVERS}}" \
+           --agents="{{.CLUSTER_AGENTS}}" || true
+      - task: k3d:getconfig
+
+  istio:install:
+    desc: Install Istio
+    deps:
+      - istio:install:cli
+    cmds:
+      - istioctl install -y
+
+  istio:install:cli:
+    desc: Install Istio CLI
+    status:
+      - bin/istioctl version
+    cmds:
+      - mkdir -p {{.USER_WORKING_DIR}}/bin
+      - curl -L https://istio.io/downloadIstio | sh -
+      - mv istio-*/bin/istioctl {{.USER_WORKING_DIR}}/bin/istioctl
+      - rm -rf istio-*
+
+  istio:setup:injection:
+    desc: Enable Istio sidecar injection on all namespaces by adding required label
+    vars:
+      FILES:
+        sh: kubectl get namespace -o name | grep -Ev 'istio-system'
+    cmds:
+      - for:
+          var: FILES
+        cmd: |
+          kubectl label {{.ITEM}} istio-injection=enabled
+
+  istio:install:verify:
+    desc: Verify Istio install
+    cmd: bin/istioctl verify-install
+
+  certmanager:install:
+    desc: install certmanager
+    cmds:
+      - "{{ .KUBECTL }} https://github.com/cert-manager/cert-manager/releases/download/{{.CERTMANAGER_VERSION}}/cert-manager.yaml"
+
+  knative:cli:install:
+    desc: Install Knative CLI
+    status:
+      - func version
+    cmds:
+      - brew tap knative-extensions/kn-plugins
+      - brew install func
+
+  camel-k:cli:install:
+    desc: Install Camel-K CLI
+    status:
+      - kamel version
+    cmds:
+      - brew install kamel
+
+  camel-k:install:
+    desc: Install Camel-K Operator
+    silent: true
+    status:
+      - kubectl wait -n {{.DEMO_NAMESPACE}} --for=condition=ready pod -l app.kubernetes.io/name=camel-k  --timeout=300s
+    deps:
+      - demo:namespace
+      - camel-k:cli:install
+    cmds:
+      - cmd: |
+          echo "" && \
+          echo "📦 Installing Camel-K..." && \
+          kamel --kube-config {{.KUBECONFIG}} install \
+                --registry {{.CLUSTER_REGISTRY_NAME}}:{{.CLUSTER_REGISTRY_PORT}} \
+                --force --namespace {{.DEMO_NAMESPACE}} && \
+          kubectl wait -n {{.DEMO_NAMESPACE}} --for=condition=ready pod -l app.kubernetes.io/name=camel-k  --timeout=300s
+          echo "✅ Camel-K installed successfully."
+
+  knative:operator:install:
+    desc: install
+    cmds:
+      - cmd: |
+          {{.KUBECTL}} https://github.com/knative/operator/releases/download/knative-{{.KNATIVE_OPERATOR_VERSION}}/operator.yaml
+
+  knative:serving:install:
+    desc: install knative serving with default DNS and HPA extension
+    cmds:
+      - cmd: |-
+          {{.KUBECTL}} https://github.com/knative/serving/releases/download/knative-{{.KNATIVE_CORE_VERSION}}/serving-crds.yaml
+          {{.KUBECTL}} https://github.com/knative/serving/releases/download/knative-{{.KNATIVE_CORE_VERSION}}/serving-core.yaml
+          {{.KUBECTL}} https://github.com/knative/net-istio/releases/download/knative-{{.KNATIVE_ISTIO_VERSION}}/net-istio.yaml
+      - task: knative:serving:install:dns
+      - task: knative:serving:install:hpa
+
+  knative:serving:install:dns:
+    desc: install knative serving default DNS (sslip.io)
+    cmd: "{{.KUBECTL}} https://github.com/knative/serving/releases/download/knative-{{.KNATIVE_SERVING_VERSION}}/serving-default-domain.yaml"
+
+  knative:serving:install:hpa:
+    desc: install knative serving HPA extension
+    cmd: "{{.KUBECTL}} https://github.com/knative/serving/releases/download/knative-{{.KNATIVE_SERVING_VERSION}}/serving-hpa.yaml"
+
+  knative:serving:setup:peerauth:
+    desc: Set PeerAuthentication to PERMISSIVE on knative-serving system namespace
+    cmds:
+      - cmd: |
+          cat <<EOF | {{.KUBECTL}} -
+          apiVersion: "security.istio.io/v1beta1"
+          kind: "PeerAuthentication"
+          metadata:
+            name: "default"
+            namespace: "knative-serving"
+          spec:
+            mtls:
+              mode: PERMISSIVE
+          EOF
+
+  knative:eventing:install:
+    desc: install knative stack
+    cmds:
+      - cmd: |-
+          {{.KUBECTL}} https://github.com/knative/eventing/releases/download/knative-{{.KNATIVE_EVENTING_VERSION}}/eventing-crds.yaml
+          {{.KUBECTL}} https://github.com/knative/eventing/releases/download/knative-{{.KNATIVE_EVENTING_VERSION}}/eventing-core.yaml
+      - task: knative:eventing:channel
+      - task: knative:eventing:broker
+      - task: knative:eventing:kafka:sink
+
+  knative:eventing:kafka:controller:
+    desc: Installs Knative Kafka Operator
+    cmds:
+      - cmd: |-
+          {{.KUBECTL}} https://github.com/knative-extensions/eventing-kafka-broker/releases/download/knative-{{.KNATIVE_EVENTING_KAFKA_CONTROLLER_VERSION}}/eventing-kafka-controller.yaml
+
+  knative:eventing:channel:
+    desc: Installs a default Channel (messaging) layer using Kafka
+    deps:
+      - knative:eventing:kafka:controller
+    cmds:
+      - cmd: |-
+          {{.KUBECTL}} https://github.com/knative-extensions/eventing-kafka-broker/releases/download/knative-{{.KNATIVE_EVENTING_KAFKA_CONTROLLER_VERSION}}/eventing-kafka-channel.yaml
+          {{.KUBECTL}} https://github.com/knative-extensions/eventing-kafka-broker/releases/download/knative-{{.KNATIVE_EVENTING_KAFKA_CONTROLLER_VERSION}}/eventing-kafka-post-install.yaml
+
+  knative:eventing:broker:
+    desc: Installs  a default Channel (messaging) layer using Kafka
+    deps:
+      - knative:eventing:kafka:controller
+    cmds:
+      - cmd: |-
+          {{.KUBECTL}} https://github.com/knative-extensions/eventing-kafka-broker/releases/download/knative-{{.KNATIVE_EVENTING_KAFKA_CONTROLLER_VERSION}}/eventing-kafka-broker.yaml
+          {{.KUBECTL}} https://github.com/knative-extensions/eventing-kafka-broker/releases/download/knative-{{.KNATIVE_EVENTING_KAFKA_CONTROLLER_VERSION}}/eventing-kafka-post-install.yaml
+
+  knative:eventing:kafka:sink:
+    desc: Install the Kafka Sink data plane
+    cmds:
+      - cmd: |-
+          {{.KUBECTL}} https://github.com/knative-extensions/eventing-kafka-broker/releases/download/knative-{{.KNATIVE_EVENTING_KAFKA_CONTROLLER_VERSION}}/eventing-kafka-sink.yaml
+
+  knative:eventing:kafka:source:
+    desc: IInstall the Apache Kafka Source
+    cmds:
+      - cmd: |-
+          {{.KUBECTL}} https://github.com/knative-extensions/eventing-kafka-broker/releases/download/knative-{{.KNATIVE_EVENTING_KAFKA_CONTROLLER_VERSION}}/eventing-kafka-source.yaml
+
+  demo:up:
+    desc: install demo bookstore app
+    cmds:
+      - task: demo:namespace
+      - task: camel-k:install
+      - task: demo:frontend
+      - task: demo:backend
+      - task: demo:mlservive:badwordfilter
+      - task: demo:mlservive:sentment
+      - task: demo:database
+      - task: demo:sequence
+
+  demo:namespace:
+    desc: install demo bookstore app frontend
+    internal: true
+    status:
+      - kubectl get namespace bookstore
+    cmds:
+      - kubectl create namespace bookstore || true
+      - kubectl label namespace bookstore istio-injection=enabled
+
+  demo:frontend:
+    desc: install demo bookstore app frontend
+    deps:
+      - demo:namespace
+    cmds:
+      - cmd: "{{.KUBECTL}} {{.USER_WORKING_DIR}}/examples/bootstore-sample-app/frontend/config -n {{.DEMO_NAMESPACE}}"
+      - cmd: |-
+          echo ""
+          echo "⏳ Waiting for the frontend to be ready..."
+          kubectl wait --for=condition=ready pod -l app=bookstore-frontend --timeout=300s -n {{.DEMO_NAMESPACE}}
+          echo "✅ The frontend is now installed. Please visit http://localhost:3000 to view the bookstore frontend."
+          echo "⚠️ If you cannot access the frontend, please open a new terminal and run 'kubectl port-forward svc/bookstore-frontend-svc 3000:3000' to forward the port to your localhost."
+
+  demo:backend:
+    desc: install demo bookstore app node server
+    deps:
+      - demo:namespace
+    cmds:
+      - cmd: "{{.KUBECTL}} {{.USER_WORKING_DIR}}/examples/bootstore-sample-app/node-server/config/100-deployment.yaml -n {{.DEMO_NAMESPACE}}"
+      - cmd: |-
+          # Wait for the backend to be ready
+          echo ""
+          echo "⏳ Waiting for the backend to be ready..."
+          kubectl wait --for=condition=ready pod -l app=node-server --timeout=300s -n {{.DEMO_NAMESPACE}}
+      - cmd: |-
+          echo ""
+          echo "✅ The node-server is now installed. Please visit http://localhost:8080 to view the bookstore node-server."
+          echo "⚠️ If you cannot access it, please run 'kubectl port-forward svc/node-server-svc 8080:80' to forward the port to your localhost."
+
+  demo:mlservive:badwordfilter:
+    desc: install demo bookstore ML service bad-word-filter
+    dir: "{{.USER_WORKING_DIR}}/examples/bootstore-sample-app/ML-bad-word-filter"
+    deps:
+      - demo:namespace
+    cmds:
+      - echo "📦 Deploying the ML service bad-word-filter..."
+      - kubectl config set-context --current --namespace {{.DEMO_NAMESPACE}}
+      - pwd
+      - echo func deploy -b=s2i -v -n {{.DEMO_NAMESPACE}} --build
+      - echo "✅ ML service bad-word-filter deployed."
+
+  demo:mlservive:sentment:
+    desc: install demo bookstore ML service sentment analysis
+    dir: "{{.USER_WORKING_DIR}}/examples/bootstore-sample-app/ML-sentiment-analysis"
+    deps:
+      - demo:namespace
+    cmds:
+      - echo "📦 Deploying the ML services sentiment-analysis..."
+      - kubectl config set-context --current --namespace {{.DEMO_NAMESPACE}}
+      - pwd
+      - echo func deploy -b=s2i -v -n {{.DEMO_NAMESPACE}} --build
+      - echo "✅ ML service sentiment-analysis deployed."
+
+  demo:database:
+    desc: install demo bookstore database
+    deps:
+      - demo:namespace
+    cmds:
+      - echo ""
+      - echo "📦 Installing the database..."
+      - echo kubectl apply -f {{.USER_WORKING_DIR}}/examples/bootstore-sample-app/db-service -n {{.DEMO_NAMESPACE}}
+      - echo "✅ Database installed."
+
+  demo:sequence:
+    desc: install demo bookstore sequence
+    deps:
+      - demo:namespace
+    cmds:
+      - echo ""
+      - echo "📦 Installing the sequence..."
+      - echo kubectl apply -f {{.USER_WORKING_DIR}}/examples/bootstore-sample-app/sequence/config -n {{.DEMO_NAMESPACE}}
+      - echo "✅ Sequence installed."

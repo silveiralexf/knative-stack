@@ -1,0 +1,11 @@
+specVersion: 0.36.0
+name: bad-word-filter
+runtime: python
+registry: k3d-knative-service-registry:5000
+namespace: bookstore
+created: 2024-03-27T23:12:06.178272+08:00
+build:
+  builder: s2i
+deploy:
+  namespace: bookstore
+  image: k3d-knative-service-registry:5000/bad-word-filter@sha256:1dd4aed3acdd84a43418d89b204dcb7222b3507b5b607db16e84c58b9e6a3489

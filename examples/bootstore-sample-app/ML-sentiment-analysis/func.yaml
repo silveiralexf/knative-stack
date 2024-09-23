@@ -1,0 +1,11 @@
+specVersion: 0.36.0
+name: sentiment-analysis-app
+runtime: python
+registry: k3d-knative-service-registry:5000
+namespace: bookstore
+created: 2024-02-01T00:18:00.06485162-04:00
+build:
+  builder: s2i
+deploy:
+  namespace: bookstore
+  image: k3d-knative-service-registry:5000/sentiment-analysis-app@sha256:a9d2bf71283bc6ddfcf7b40ac7b38a71cf16001dcda068073923189d2c5ca557
